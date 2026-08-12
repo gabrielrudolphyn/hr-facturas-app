@@ -5,7 +5,7 @@ from datetime import datetime
 import pandas as pd
 from pypdf import PdfReader
 
-DB = Path("facturas_multiempresa_v4.db")
+DB = Path("facturas_multiempresa_v5.db")
 UPLOADS = Path("uploads")
 UPLOADS.mkdir(exist_ok=True)
 
@@ -76,6 +76,14 @@ def init():
         invoice_id INTEGER,
         confidence REAL DEFAULT 0
     );
+
+    CREATE TABLE IF NOT EXISTS bank_accounts(
+        id INTEGER PRIMARY KEY,
+        company_id INTEGER,
+        bank_name TEXT,
+        account_number TEXT UNIQUE,
+        alias TEXT
+    );
     """)
     c.commit()
     c.close()
@@ -91,6 +99,44 @@ def clean_rut(s):
 
 def digits(s):
     return re.sub(r"[^0-9Kk]", "", s or "").upper()
+
+
+def normalize_account(s):
+    return re.sub(r"[^0-9]", "", s or "")
+
+def account_upsert(company_id, bank_name, account_number, alias=""):
+    acc = normalize_account(account_number)
+    if not company_id or not acc:
+        return None
+    c = conn()
+    c.execute("""
+        INSERT OR IGNORE INTO bank_accounts(company_id,bank_name,account_number,alias)
+        VALUES(?,?,?,?)
+    """, (company_id, spaces(bank_name), acc, spaces(alias)))
+    c.execute("""
+        UPDATE bank_accounts
+        SET company_id=?, bank_name=?, alias=?
+        WHERE account_number=?
+    """, (company_id, spaces(bank_name), spaces(alias), acc))
+    c.commit()
+    row = c.execute("SELECT id FROM bank_accounts WHERE account_number=?", (acc,)).fetchone()
+    c.close()
+    return row["id"] if row else None
+
+def company_from_account(account_number):
+    acc = normalize_account(account_number)
+    if not acc:
+        return None
+    c = conn()
+    row = c.execute("""
+        SELECT ba.company_id, c.name, c.rut, ba.bank_name, ba.account_number
+        FROM bank_accounts ba
+        JOIN companies c ON c.id=ba.company_id
+        WHERE ba.account_number=?
+        LIMIT 1
+    """, (acc,)).fetchone()
+    c.close()
+    return row
 
 def money(s):
     return int(re.sub(r"[^0-9]", "", s or "0"))
@@ -140,6 +186,15 @@ def upsert_company(name, rut):
     row = c.execute("SELECT id FROM companies WHERE rut=?", (rut,)).fetchone()
     c.close()
     return row["id"] if row else None
+
+
+def seed_known_accounts():
+    hr_id = upsert_company("HR ARQUITECTOS LIMITADA.", "77.704.666-7")
+    grs_id = upsert_company("GRS SPA", "76.713.209-3")
+    if hr_id:
+        account_upsert(hr_id, "Banco Santander", "0-000-8996516-0", "Cuenta principal HR")
+    if grs_id:
+        account_upsert(grs_id, "Banco de Chile", "00-310-17309-04", "Cuenta principal GRS")
 
 # ---------------- SII ----------------
 
@@ -227,6 +282,28 @@ def bank_company(t):
                     continue
                 return candidate, ""
     return "", ""
+
+
+def detect_bank_name(t):
+    u = t.upper()
+    if "SANTANDER" in u:
+        return "Banco Santander"
+    if "BANCO EDWARDS" in u:
+        return "Banco Edwards / Banco de Chile"
+    if "BANCO DE CHILE" in u or "CARTOLAS HISTÓRICAS" in u:
+        return "Banco de Chile"
+    return ""
+
+def extract_account_number(t):
+    m = re.search(r"Cuenta:\s*([0-9\-]+)", t, re.I)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"N[°º]?\s*DE\s*CUENTA\s*:?\s*([0-9\-]+)", t, re.I)
+    if m:
+        return m.group(1)
+
+    return ""
 
 def banco_edwards_expected_abonos(t):
     # Summary footer: DEPOSITOS / CHEQUES / OTROS ABONOS / OTROS CARGOS ...
@@ -455,8 +532,17 @@ def save_doc(f):
         cid = upsert_company(cname, crut)
 
     elif typ == "cartola":
-        cname, crut = bank_company(t)
-        cid = upsert_company(cname, crut) if crut else None
+        bank_name = detect_bank_name(t)
+        account_number = extract_account_number(t)
+        account_row = company_from_account(account_number)
+
+        if account_row:
+            cid = account_row["company_id"]
+            cname = account_row["name"]
+            crut = account_row["rut"]
+        else:
+            cname, crut = bank_company(t)
+            cid = upsert_company(cname, crut) if crut else None
 
     movements = []
     expected_abonos = 0
@@ -550,7 +636,9 @@ def save_doc(f):
     if cid:
         reconcile(cid)
 
-    return typ, cname, crut, detected_abonos, expected_abonos
+    bank_name = detect_bank_name(t) if typ == "cartola" else ""
+    account_number = extract_account_number(t) if typ == "cartola" else ""
+    return typ, cname, crut, detected_abonos, expected_abonos, bank_name, account_number
 
 def df(sql, params=()):
     c = conn()
@@ -559,6 +647,8 @@ def df(sql, params=()):
     return x
 
 # ---------------- UI ----------------
+
+seed_known_accounts()
 
 st.title("Control de Facturas y Cobranza")
 st.caption("Versión multiempresa · Facturas SII + cartolas bancarias + conciliación.")
@@ -574,7 +664,7 @@ if not companies.empty:
     sel = st.selectbox("Empresa", list(opts))
     cid = opts[sel]
 
-tabs = st.tabs(["Dashboard","Subir documentos","Facturas","Pagos","Documentos"])
+tabs = st.tabs(["Dashboard","Subir documentos","Facturas","Pagos","Documentos","Cuentas bancarias"])
 
 with tabs[1]:
     fs = st.file_uploader(
@@ -587,19 +677,19 @@ with tabs[1]:
         rows = []
         for f in fs:
             try:
-                typ, n, r, detected, expected = save_doc(f)
+                typ, n, r, detected, expected, bank_name, account_number = save_doc(f)
                 validation = ""
                 if typ == "cartola" and expected:
                     validation = "OK" if detected == expected else f"REVISAR: detectado ${detected:,} / cartola ${expected:,}".replace(",",".")
-                rows.append([f.name,typ,n,r,detected,expected,validation,"OK"])
+                rows.append([f.name,typ,n,r,bank_name,account_number,detected,expected,validation,"OK"])
             except Exception as e:
-                rows.append([f.name,"error","","",0,0,"",str(e)])
+                rows.append([f.name,"error","","","","",0,0,"",str(e)])
 
         st.dataframe(
             pd.DataFrame(
                 rows,
                 columns=[
-                    "Archivo","Tipo","Empresa detectada","RUT",
+                    "Archivo","Tipo","Empresa detectada","RUT","Banco","Cuenta",
                     "Abonos detectados","Abonos según cartola",
                     "Validación","Resultado"
                 ]
@@ -744,3 +834,48 @@ with tabs[4]:
             """, (cid,)),
             use_container_width=True
         )
+
+
+with tabs[5]:
+    st.subheader("Cuentas bancarias")
+
+    companies_all = df("SELECT id,name,rut FROM companies ORDER BY name")
+    accounts_all = df("""
+        SELECT ba.id, c.name AS empresa, c.rut, ba.bank_name AS banco,
+               ba.account_number AS cuenta, ba.alias
+        FROM bank_accounts ba
+        JOIN companies c ON c.id=ba.company_id
+        ORDER BY c.name, ba.bank_name
+    """)
+    st.dataframe(accounts_all, use_container_width=True)
+
+    st.divider()
+    st.subheader("Agregar o actualizar cuenta")
+
+    if companies_all.empty:
+        st.info("Primero debe existir al menos una empresa.")
+    else:
+        company_options = {
+            f"{r['name']} · {r['rut']}": int(r["id"])
+            for _, r in companies_all.iterrows()
+        }
+        company_label = st.selectbox(
+            "Empresa de la cuenta",
+            list(company_options.keys()),
+            key="bank_company_select"
+        )
+        bank_name_input = st.text_input("Banco", placeholder="Ej: Banco Santander")
+        account_input = st.text_input("Número de cuenta", placeholder="Ej: 0-000-8996516-0")
+        alias_input = st.text_input("Alias", placeholder="Ej: Cuenta principal")
+
+        if st.button("Guardar cuenta bancaria"):
+            if not account_input.strip():
+                st.error("Ingresa un número de cuenta.")
+            else:
+                account_upsert(
+                    company_options[company_label],
+                    bank_name_input,
+                    account_input,
+                    alias_input
+                )
+                st.success("Cuenta bancaria guardada.")

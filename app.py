@@ -5,7 +5,7 @@ from datetime import datetime
 import pandas as pd
 from pypdf import PdfReader
 
-DB = Path("facturas_multiempresa_v3.db")
+DB = Path("facturas_multiempresa_v4.db")
 UPLOADS = Path("uploads")
 UPLOADS.mkdir(exist_ok=True)
 
@@ -214,8 +214,18 @@ def bank_company(t):
 
     lines = [spaces(x) for x in t.splitlines() if spaces(x)]
     for i, x in enumerate(lines):
-        if x.upper() == "SR(A)(ES)" and i + 1 < len(lines):
-            return lines[i+1], ""
+        if x.upper() == "SR(A)(ES)":
+            # Banco Edwards PDF extraction may put email before company name.
+            candidates = lines[i+1:i+5]
+            for candidate in candidates:
+                cu = candidate.upper()
+                if "@" in candidate:
+                    continue
+                if cu.startswith("CUENTA ") or cu.startswith("ESTADO "):
+                    continue
+                if re.fullmatch(r"\d+", candidate):
+                    continue
+                return candidate, ""
     return "", ""
 
 def banco_edwards_expected_abonos(t):

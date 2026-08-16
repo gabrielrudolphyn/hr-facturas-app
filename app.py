@@ -94,6 +94,17 @@ def init():
         last_error TEXT,
         certificate_subject TEXT
     );
+
+
+    CREATE TABLE IF NOT EXISTS sii_dte_status(
+        invoice_id INTEGER PRIMARY KEY,
+        checked_at TEXT,
+        estado TEXT,
+        glosa TEXT,
+        err_code TEXT,
+        glosa_err TEXT,
+        num_atencion TEXT
+    );
     """)
     c.commit()
     c.close()
@@ -248,7 +259,7 @@ def sii_session_key(company_id, field):
 def sii_clear_session(company_id):
     if not company_id:
         return
-    for field in ["token", "connected_at", "certificate_subject"]:
+    for field in ["token", "connected_at", "certificate_subject", "consultant_rut"]:
         st.session_state.pop(sii_session_key(company_id, field), None)
 
 def sii_connect_temp(company_id, uploaded_cert, password, environment="production"):
@@ -296,11 +307,13 @@ def sii_connect_temp(company_id, uploaded_cert, password, environment="productio
         token = connector.get_token(signed)
 
         subject = connector.certificate_subject()
+        consultant_rut = connector.certificate_rut()
         now = datetime.now().isoformat(timespec="seconds")
 
         st.session_state[sii_session_key(company_id, "token")] = token
         st.session_state[sii_session_key(company_id, "connected_at")] = now
         st.session_state[sii_session_key(company_id, "certificate_subject")] = subject
+        st.session_state[sii_session_key(company_id, "consultant_rut")] = consultant_rut
 
         sii_status_save(
             company_id,
@@ -340,6 +353,45 @@ def sii_connect_temp(company_id, uploaded_cert, password, environment="productio
                 pass
             except Exception:
                 pass
+
+def sii_dte_type(kind):
+    k = (kind or "").upper()
+    if "EXENTA" in k:
+        return "34"
+    if "NOTA DE CREDITO" in k or "NOTA DE CRÉDITO" in k:
+        return "61"
+    return "33"
+
+def sii_format_date(iso_date):
+    try:
+        return datetime.strptime(iso_date, "%Y-%m-%d").strftime("%d%m%Y")
+    except Exception:
+        return ""
+
+def sii_save_dte_status(invoice_id, result):
+    c = conn()
+    c.execute("""
+        INSERT INTO sii_dte_status(
+            invoice_id,checked_at,estado,glosa,err_code,glosa_err,num_atencion
+        ) VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(invoice_id) DO UPDATE SET
+            checked_at=excluded.checked_at,
+            estado=excluded.estado,
+            glosa=excluded.glosa,
+            err_code=excluded.err_code,
+            glosa_err=excluded.glosa_err,
+            num_atencion=excluded.num_atencion
+    """, (
+        int(invoice_id),
+        datetime.now().isoformat(timespec="seconds"),
+        result.get("estado",""),
+        result.get("glosa",""),
+        result.get("err_code",""),
+        result.get("glosa_err",""),
+        result.get("num_atencion",""),
+    ))
+    c.commit()
+    c.close()
 
 def parse_invoice(t):
     u = t.upper()
@@ -794,7 +846,7 @@ def df(sql, params=()):
 seed_known_accounts()
 
 st.title("Control de Facturas y Cobranza")
-st.caption("Versión multiempresa · Facturas SII + cartolas bancarias + conciliación.")
+st.caption("V5.2 · Multiempresa · SII conectado · Facturas + cartolas + conciliación.")
 
 companies = df("SELECT * FROM companies ORDER BY name")
 cid = None
@@ -1066,6 +1118,9 @@ with tabs[6]:
         token = st.session_state.get(token_key)
         connected_at = st.session_state.get(connected_key)
         session_subject = st.session_state.get(subject_key)
+        consultant_rut = st.session_state.get(
+            sii_session_key(sii_cid, "consultant_rut")
+        )
 
         persisted = sii_status_get(sii_cid)
 
@@ -1198,22 +1253,159 @@ with tabs[6]:
                 st.rerun()
 
         st.divider()
-        st.markdown("#### Sincronización de documentos")
-
-        if token:
-            st.success(
-                "La autenticación está lista para la siguiente etapa: "
-                "consulta e importación automática de documentos del SII."
-            )
-        else:
-            st.info(
-                "Conecta primero la empresa al SII. "
-                "La importación automática de DTE se incorporará en la siguiente etapa."
-            )
+        st.markdown("#### Verificación de facturas en SII")
 
         st.caption(
-            "V5.1 incorpora autenticación y estado de conexión. "
-            "Todavía no descarga masivamente DTE; esa función se añadirá "
-            "sobre esta conexión ya validada."
+            "V5.2 usa el Web Service oficial QueryEstDte para consultar "
+            "las facturas que ya existen en la aplicación."
+        )
+
+        if not token:
+            st.info("Conecta primero la empresa al SII.")
+        elif not consultant_rut:
+            st.warning(
+                "No fue posible extraer el RUT del titular del certificado. "
+                "Desconecta y vuelve a conectar con la V5.2."
+            )
+        else:
+            invoices_to_check = df("""
+                SELECT i.id,i.number,i.kind,i.issue_date,i.client_name,
+                       i.client_rut,i.total,i.status,
+                       s.checked_at,s.estado AS sii_estado,s.glosa AS sii_glosa,
+                       s.err_code,s.glosa_err,s.num_atencion
+                FROM invoices i
+                LEFT JOIN sii_dte_status s ON s.invoice_id=i.id
+                WHERE i.company_id=?
+                ORDER BY i.issue_date DESC, i.number DESC
+            """, (sii_cid,))
+
+            total_inv = len(invoices_to_check)
+            checked = (
+                int(invoices_to_check["checked_at"].notna().sum())
+                if not invoices_to_check.empty else 0
+            )
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Facturas en la app", total_inv)
+            m2.metric("Verificadas en SII", checked)
+            m3.metric("Pendientes", max(0, total_inv - checked))
+
+            if st.button(
+                "Verificar todas las facturas en SII",
+                type="primary",
+                key=f"sii_verify_all_{sii_cid}",
+                use_container_width=True,
+                disabled=invoices_to_check.empty
+            ):
+                progress = st.progress(0)
+                status_box = st.empty()
+                results = []
+
+                # Reutilizar el conector sólo como cliente QueryEstDte.
+                # El certificado se necesita para crear el objeto, así que
+                # la verificación se hace mientras el uploader y password
+                # siguen disponibles en esta sesión.
+                if not sii_cert or not sii_password:
+                    st.error(
+                        "Para verificar ahora, vuelve a seleccionar el certificado "
+                        "y escribe su contraseña. No se guardarán."
+                    )
+                else:
+                    temp_path = None
+                    try:
+                        suffix = Path(sii_cert.name or "certificado.p12").suffix
+                        with tempfile.NamedTemporaryFile(
+                            mode="wb", suffix=suffix, delete=False
+                        ) as tmp:
+                            tmp.write(sii_cert.getvalue())
+                            temp_path = tmp.name
+
+                        query_client = SIIConnector(
+                            temp_path,
+                            sii_password,
+                            environment=environment
+                        )
+
+                        for idx, row in enumerate(invoices_to_check.itertuples(), start=1):
+                            status_box.info(
+                                f"Consultando factura {int(row.number)} "
+                                f"({idx}/{total_inv})..."
+                            )
+
+                            if not row.client_rut or not row.issue_date or not row.total:
+                                result = {
+                                    "estado": "LOCAL",
+                                    "glosa": "Datos insuficientes para consultar",
+                                    "err_code": "",
+                                    "glosa_err": "Falta RUT receptor, fecha o monto",
+                                    "num_atencion": "",
+                                }
+                            else:
+                                try:
+                                    result = query_client.query_dte_status(
+                                        token=token,
+                                        consultant_rut=consultant_rut,
+                                        company_rut=company_row["rut"],
+                                        receiver_rut=row.client_rut,
+                                        dte_type=sii_dte_type(row.kind),
+                                        folio=int(row.number),
+                                        issue_date_ddmmyyyy=sii_format_date(row.issue_date),
+                                        total_amount=int(row.total),
+                                    )
+                                except Exception as e:
+                                    result = {
+                                        "estado": "ERROR",
+                                        "glosa": str(e),
+                                        "err_code": "",
+                                        "glosa_err": "",
+                                        "num_atencion": "",
+                                    }
+
+                            sii_save_dte_status(row.id, result)
+                            results.append({
+                                "Factura": int(row.number),
+                                "Cliente": row.client_name,
+                                "RUT": row.client_rut,
+                                "Total": int(row.total),
+                                "Estado SII": result.get("estado",""),
+                                "Glosa": result.get("glosa",""),
+                                "Detalle": result.get("glosa_err",""),
+                            })
+                            progress.progress(idx / total_inv)
+
+                        status_box.success("Verificación SII terminada.")
+                        st.dataframe(
+                            pd.DataFrame(results),
+                            use_container_width=True
+                        )
+                        st.rerun()
+
+                    finally:
+                        if temp_path:
+                            try:
+                                os.remove(temp_path)
+                            except Exception:
+                                pass
+
+            if not invoices_to_check.empty:
+                display = invoices_to_check[[
+                    "number","kind","issue_date","client_name","client_rut",
+                    "total","status","checked_at","sii_estado","sii_glosa",
+                    "glosa_err","num_atencion"
+                ]].copy()
+
+                display.columns = [
+                    "Factura","Tipo","Fecha","Cliente","RUT receptor",
+                    "Total","Estado local","Última consulta",
+                    "Estado SII","Glosa SII","Detalle","N° atención"
+                ]
+
+                st.dataframe(display, use_container_width=True)
+
+        st.info(
+            "El SII documenta QueryEstDte para consultar documentos individuales. "
+            "No publica en esta interfaz técnica un método de listado masivo de "
+            "todos los DTE emitidos; por eso V5.2 verifica automáticamente los "
+            "documentos ya conocidos por la app."
         )
 

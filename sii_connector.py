@@ -10,6 +10,7 @@ import requests
 from lxml import etree
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs12
+from cryptography.x509.oid import NameOID
 import xmlsec
 
 
@@ -325,6 +326,109 @@ class SIIConnector:
         ctx.key = self._make_xmlsec_key()
         ctx.verify(signature_node)
         return True
+
+    def certificate_rut(self):
+        """
+        Retorna el RUT del titular del certificado cuando viene en
+        serialNumber (OID 2.5.4.5), por ejemplo 10346722-5.
+        """
+        try:
+            attrs = self.certificate.subject.get_attributes_for_oid(
+                NameOID.SERIAL_NUMBER
+            )
+            if attrs:
+                return str(attrs[0].value).strip()
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _split_rut(rut):
+        clean = re.sub(r"[^0-9Kk]", "", rut or "").upper()
+        if len(clean) < 2:
+            raise SIIError(f"RUT inválido: {rut}")
+        return clean[:-1], clean[-1]
+
+    def query_dte_status(
+        self,
+        token,
+        consultant_rut,
+        company_rut,
+        receiver_rut,
+        dte_type,
+        folio,
+        issue_date_ddmmyyyy,
+        total_amount,
+    ):
+        """
+        Consulta oficial QueryEstDte.jws para un DTE conocido.
+        Retorna ESTADO, GLOSA, ERR_CODE, GLOSA_ERR y NUM_ATENCION.
+        """
+        rut_cons, dv_cons = self._split_rut(consultant_rut)
+        rut_comp, dv_comp = self._split_rut(company_rut)
+        rut_rec, dv_rec = self._split_rut(receiver_rut)
+
+        ns = f"https://{self.host}/DTEWS/QueryEstDte.jws"
+        url = ns
+
+        params = [
+            ("RutConsultante", rut_cons),
+            ("DvConsultante", dv_cons),
+            ("RutCompania", rut_comp),
+            ("DvCompania", dv_comp),
+            ("RutReceptor", rut_rec),
+            ("DvReceptor", dv_rec),
+            ("TipoDte", str(dte_type)),
+            ("FolioDte", str(folio)),
+            ("FechaEmisionDte", str(issue_date_ddmmyyyy)),
+            ("MontoDte", str(int(total_amount))),
+            ("Token", str(token)),
+        ]
+
+        values = "".join(
+            f'<{name} xsi:type="xsd:string">{html.escape(value)}</{name}>'
+            for name, value in params
+        )
+
+        body = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f'<SOAP-ENV:Envelope xmlns:SOAP-ENV="{self.SOAP_NS}" '
+            f'xmlns:SOAP-ENC="{self.SOAP_ENC}" '
+            f'xmlns:xsi="{self.XSI_NS}" '
+            f'xmlns:xsd="{self.XSD_NS}" '
+            f'SOAP-ENV:encodingStyle="{self.SOAP_ENC}">'
+            '<SOAP-ENV:Body>'
+            f'<m:getEstDte xmlns:m="{ns}">'
+            f'{values}'
+            '</m:getEstDte>'
+            '</SOAP-ENV:Body>'
+            '</SOAP-ENV:Envelope>'
+        ).encode("utf-8")
+
+        response = self._post_soap(
+            url,
+            body,
+            "last_query_dte_request.xml",
+        )
+        Path("last_query_dte_soap_response.xml").write_bytes(response)
+
+        inner = self._soap_string(response, "getEstDteReturn")
+        Path("last_query_dte_response.xml").write_text(
+            inner, encoding="utf-8"
+        )
+
+        root = etree.fromstring(inner.encode("utf-8"))
+
+        def x(name):
+            return root.xpath(f"string(//*[local-name()='{name}'])")
+
+        return {
+            "estado": x("ESTADO"),
+            "glosa": x("GLOSA"),
+            "err_code": x("ERR_CODE"),
+            "glosa_err": x("GLOSA_ERR"),
+            "num_atencion": x("NUM_ATENCION"),
+        }
 
     def get_token(self, signed_xml):
         # Bloqueo final antes de enviar.

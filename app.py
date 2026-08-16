@@ -1,9 +1,10 @@
 import streamlit as st
-import sqlite3, re
+import sqlite3, re, tempfile, os
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
 from pypdf import PdfReader
+from sii_connector import SIIConnector, SIIError
 
 DB = Path("facturas_multiempresa_v5.db")
 UPLOADS = Path("uploads")
@@ -83,6 +84,15 @@ def init():
         bank_name TEXT,
         account_number TEXT UNIQUE,
         alias TEXT
+    );
+
+
+    CREATE TABLE IF NOT EXISTS sii_sync_status(
+        company_id INTEGER PRIMARY KEY,
+        last_sync_at TEXT,
+        last_status TEXT,
+        last_error TEXT,
+        certificate_subject TEXT
     );
     """)
     c.commit()
@@ -197,6 +207,139 @@ def seed_known_accounts():
         account_upsert(grs_id, "Banco de Chile", "00-310-17309-04", "Cuenta principal GRS")
 
 # ---------------- SII ----------------
+
+def sii_status_get(company_id):
+    if not company_id:
+        return None
+    c = conn()
+    row = c.execute("""
+        SELECT company_id,last_sync_at,last_status,last_error,certificate_subject
+        FROM sii_sync_status
+        WHERE company_id=?
+    """, (company_id,)).fetchone()
+    c.close()
+    return row
+
+def sii_status_save(company_id, status, error="", certificate_subject=""):
+    if not company_id:
+        return
+    now = datetime.now().isoformat(timespec="seconds")
+    c = conn()
+    c.execute("""
+        INSERT INTO sii_sync_status(
+            company_id,last_sync_at,last_status,last_error,certificate_subject
+        ) VALUES(?,?,?,?,?)
+        ON CONFLICT(company_id) DO UPDATE SET
+            last_sync_at=excluded.last_sync_at,
+            last_status=excluded.last_status,
+            last_error=excluded.last_error,
+            certificate_subject=excluded.certificate_subject
+    """, (
+        company_id, now, status,
+        (error or "")[:1000],
+        (certificate_subject or "")[:500]
+    ))
+    c.commit()
+    c.close()
+
+def sii_session_key(company_id, field):
+    return f"sii_{field}_{int(company_id)}"
+
+def sii_clear_session(company_id):
+    if not company_id:
+        return
+    for field in ["token", "connected_at", "certificate_subject"]:
+        st.session_state.pop(sii_session_key(company_id, field), None)
+
+def sii_connect_temp(company_id, uploaded_cert, password, environment="production"):
+    """
+    Autentica con SII usando V4.5 sin persistir certificado ni contraseña.
+
+    - UploadedFile -> archivo temporal local.
+    - contraseña -> solo variable local durante esta llamada.
+    - archivo temporal -> eliminado en finally.
+    - token -> solo st.session_state.
+    - SQLite -> solo metadatos no sensibles.
+    """
+    if not company_id:
+        raise ValueError("Selecciona una empresa.")
+    if uploaded_cert is None:
+        raise ValueError("Selecciona un certificado .p12 o .pfx.")
+    if not password:
+        raise ValueError("Ingresa la contraseña del certificado.")
+
+    suffix = Path(uploaded_cert.name or "certificado.p12").suffix.lower()
+    if suffix not in [".p12", ".pfx"]:
+        suffix = ".p12"
+
+    temp_path = None
+    connector = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            suffix=suffix,
+            prefix="sii_cert_",
+            delete=False
+        ) as tmp:
+            tmp.write(uploaded_cert.getvalue())
+            temp_path = tmp.name
+
+        connector = SIIConnector(
+            temp_path,
+            password,
+            environment=environment
+        )
+
+        seed = connector.get_seed()
+        signed = connector.sign_seed(seed)
+        connector.verify_signed_seed_locally(signed)
+        token = connector.get_token(signed)
+
+        subject = connector.certificate_subject()
+        now = datetime.now().isoformat(timespec="seconds")
+
+        st.session_state[sii_session_key(company_id, "token")] = token
+        st.session_state[sii_session_key(company_id, "connected_at")] = now
+        st.session_state[sii_session_key(company_id, "certificate_subject")] = subject
+
+        sii_status_save(
+            company_id,
+            "Conectado",
+            "",
+            subject
+        )
+
+        return {
+            "token": token,
+            "connected_at": now,
+            "certificate_subject": subject,
+        }
+
+    except Exception as e:
+        sii_clear_session(company_id)
+        subject = ""
+        try:
+            if connector is not None:
+                subject = connector.certificate_subject()
+        except Exception:
+            pass
+        sii_status_save(
+            company_id,
+            "Error",
+            str(e),
+            subject
+        )
+        raise
+
+    finally:
+        # Borrado explícito del archivo temporal del certificado.
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
 
 def parse_invoice(t):
     u = t.upper()
@@ -664,7 +807,7 @@ if not companies.empty:
     sel = st.selectbox("Empresa", list(opts))
     cid = opts[sel]
 
-tabs = st.tabs(["Dashboard","Subir documentos","Facturas","Pagos","Documentos","Cuentas bancarias"])
+tabs = st.tabs(["Dashboard","Subir documentos","Facturas","Pagos","Documentos","Cuentas bancarias","SII"])
 
 with tabs[1]:
     fs = st.file_uploader(
@@ -879,3 +1022,198 @@ with tabs[5]:
                     alias_input
                 )
                 st.success("Cuenta bancaria guardada.")
+
+
+with tabs[6]:
+    st.subheader("Conexión con SII")
+    st.caption(
+        "Autenticación automática mediante certificado digital. "
+        "El certificado y su contraseña no se guardan."
+    )
+
+    companies_sii = df("SELECT id,name,rut FROM companies ORDER BY name")
+
+    if companies_sii.empty:
+        st.info("Primero debe existir al menos una empresa.")
+    else:
+        sii_options = {
+            f"{r['name']} · {r['rut']}": int(r["id"])
+            for _, r in companies_sii.iterrows()
+        }
+
+        default_index = 0
+        if cid:
+            ids = list(sii_options.values())
+            if cid in ids:
+                default_index = ids.index(cid)
+
+        sii_company_label = st.selectbox(
+            "Empresa",
+            list(sii_options.keys()),
+            index=default_index,
+            key="sii_company_select"
+        )
+        sii_cid = sii_options[sii_company_label]
+
+        company_row = companies_sii[
+            companies_sii["id"] == sii_cid
+        ].iloc[0]
+
+        token_key = sii_session_key(sii_cid, "token")
+        connected_key = sii_session_key(sii_cid, "connected_at")
+        subject_key = sii_session_key(sii_cid, "certificate_subject")
+
+        token = st.session_state.get(token_key)
+        connected_at = st.session_state.get(connected_key)
+        session_subject = st.session_state.get(subject_key)
+
+        persisted = sii_status_get(sii_cid)
+
+        status_col, sync_col, company_col = st.columns(3)
+
+        if token:
+            status_col.success("🟢 SII conectado")
+        else:
+            status_col.info("⚪ SII desconectado")
+
+        last_sync = persisted["last_sync_at"] if persisted else None
+        sync_col.metric(
+            "Última sincronización",
+            last_sync.replace("T", " ") if last_sync else "Aún no realizada"
+        )
+        company_col.metric("RUT empresa", company_row["rut"])
+
+        if persisted and persisted["last_status"] == "Error":
+            st.warning(
+                "Último intento: "
+                + (persisted["last_error"] or "Error de conexión")
+            )
+
+        if session_subject:
+            st.caption(f"Certificado de esta sesión: {session_subject}")
+        elif persisted and persisted["certificate_subject"]:
+            st.caption(
+                "Último certificado utilizado: "
+                f"{persisted['certificate_subject']}"
+            )
+
+        st.divider()
+
+        left, right = st.columns([1, 1])
+
+        with left:
+            st.markdown("#### Certificado temporal")
+            sii_cert = st.file_uploader(
+                "Certificado digital (.p12 o .pfx)",
+                type=["p12", "pfx"],
+                accept_multiple_files=False,
+                key=f"sii_cert_upload_{sii_cid}",
+                help=(
+                    "Se usa únicamente durante la autenticación y se elimina "
+                    "del almacenamiento temporal inmediatamente después."
+                )
+            )
+
+            sii_password = st.text_input(
+                "Contraseña del certificado",
+                type="password",
+                key=f"sii_password_{sii_cid}",
+                help="No se escribe en la base de datos ni en archivos."
+            )
+
+            environment = st.selectbox(
+                "Ambiente",
+                ["production", "certification"],
+                format_func=lambda x: (
+                    "Producción" if x == "production" else "Certificación"
+                ),
+                key=f"sii_environment_{sii_cid}"
+            )
+
+        with right:
+            st.markdown("#### Seguridad")
+            st.write(
+                "• El `.p12/.pfx` se copia a un archivo temporal solo durante "
+                "el proceso de autenticación."
+            )
+            st.write(
+                "• La contraseña vive únicamente en memoria mientras se ejecuta "
+                "la conexión."
+            )
+            st.write(
+                "• El token se mantiene solo en la sesión actual de Streamlit."
+            )
+            st.write(
+                "• En la base de datos solo se guarda la fecha, estado y titular "
+                "del último certificado utilizado."
+            )
+
+        action_col1, action_col2 = st.columns([1, 1])
+
+        with action_col1:
+            if st.button(
+                "Conectar con SII",
+                type="primary",
+                key=f"sii_connect_{sii_cid}",
+                use_container_width=True
+            ):
+                if not sii_cert:
+                    st.error("Carga primero el certificado .p12/.pfx.")
+                elif not sii_password:
+                    st.error("Ingresa la contraseña del certificado.")
+                else:
+                    try:
+                        with st.spinner(
+                            "Autenticando: semilla → firma → token..."
+                        ):
+                            result = sii_connect_temp(
+                                sii_cid,
+                                sii_cert,
+                                sii_password,
+                                environment
+                            )
+
+                        st.success(
+                            "Conexión SII exitosa. "
+                            "El certificado temporal ya fue eliminado."
+                        )
+                        st.caption(
+                            "Conectado: "
+                            + result["connected_at"].replace("T", " ")
+                        )
+                        st.rerun()
+
+                    except Exception as e:
+                        st.error(f"No fue posible conectar con SII: {e}")
+
+        with action_col2:
+            if st.button(
+                "Desconectar esta sesión",
+                key=f"sii_disconnect_{sii_cid}",
+                use_container_width=True,
+                disabled=not bool(token)
+            ):
+                sii_clear_session(sii_cid)
+                st.success("Token eliminado de la sesión.")
+                st.rerun()
+
+        st.divider()
+        st.markdown("#### Sincronización de documentos")
+
+        if token:
+            st.success(
+                "La autenticación está lista para la siguiente etapa: "
+                "consulta e importación automática de documentos del SII."
+            )
+        else:
+            st.info(
+                "Conecta primero la empresa al SII. "
+                "La importación automática de DTE se incorporará en la siguiente etapa."
+            )
+
+        st.caption(
+            "V5.1 incorpora autenticación y estado de conexión. "
+            "Todavía no descarga masivamente DTE; esa función se añadirá "
+            "sobre esta conexión ya validada."
+        )
+

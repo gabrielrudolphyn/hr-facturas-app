@@ -1,5 +1,6 @@
 import streamlit as st
 import sqlite3, re, tempfile, os
+from migration_v53 import preflight as v53_preflight, execute as v53_execute, status as v53_status
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
@@ -846,7 +847,7 @@ def df(sql, params=()):
 seed_known_accounts()
 
 st.title("Control de Facturas y Cobranza")
-st.caption("V5.2 · Multiempresa · SII conectado · Facturas + cartolas + conciliación.")
+st.caption("V5.3 Migration · Multiempresa · SII + nuevo modelo DTE.")
 
 companies = df("SELECT * FROM companies ORDER BY name")
 cid = None
@@ -1408,4 +1409,39 @@ with tabs[6]:
             "todos los DTE emitidos; por eso V5.2 verifica automáticamente los "
             "documentos ya conocidos por la app."
         )
+
+st.divider()
+st.subheader("Migración de base de datos V5.3")
+st.caption("Migra facturas y conciliaciones al nuevo modelo DTE. No borra invoices ni payments.")
+ms=v53_status(DB)
+if ms.get("migrated"):
+    st.success(f"Estructura V5.3 detectada · DTE {ms['dte_count']} · Estados {ms['app_state_count']} · Asignaciones {ms['allocation_count']}")
+if st.button("Analizar migración V5.3", key="v53_analyze"):
+    st.session_state["v53_pre"]=v53_preflight(DB)
+pre=st.session_state.get("v53_pre")
+if pre:
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("Facturas",pre["invoices"]); c2.metric("Pagos",pre["payments"]); c3.metric("Conciliados",pre["reconciled_payments"]); c4.metric("Integridad",pre["integrity"])
+    st.write("Total facturado:",f"${int(pre['invoice_total']):,}".replace(",","."),"· Total conciliado:",f"${int(pre['reconciled_total']):,}".replace(",","."))
+    if pre["unknown_types"]: st.error(f"Tipos desconocidos: {pre['unknown_types']}")
+    if pre["duplicates"]: st.error(f"Duplicados: {pre['duplicates']}")
+    if pre["invalid_rows"]: st.error(f"Filas inválidas: {pre['invalid_rows']}")
+    if pre["critical_ok"]: st.success("PRE-FLIGHT PASS")
+    else: st.error("PRE-FLIGHT FAIL")
+    confirm=st.checkbox("Confirmo ejecutar la migración V5.3",key="v53_confirm")
+    if st.button("Ejecutar migración V5.3",type="primary",disabled=not(pre["critical_ok"] and confirm),key="v53_exec"):
+        try:
+            with st.spinner("Creando backup, migrando y validando..."):
+                res=v53_execute(DB)
+            st.session_state["v53_result"]=res
+            st.success("MIGRATION V5.3: PASS")
+            st.rerun()
+        except Exception as e:
+            st.error(f"MIGRATION V5.3: ROLLBACK · {e}")
+res=st.session_state.get("v53_result")
+if res:
+    st.json(res)
+    bp=Path(res.get("backup_path",""))
+    if bp.exists():
+        st.download_button("Descargar backup pre-V5.3",bp.read_bytes(),file_name=bp.name,mime="application/octet-stream",key="v53_backup")
 
